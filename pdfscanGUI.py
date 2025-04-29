@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk, simpledialog
 from tkinter import scrolledtext
 import fitz  # PyMuPDF
 from PIL import Image, ImageTk, ImageDraw, ImageFont
@@ -22,6 +22,10 @@ import hashlib
 import re
 import logging
 from logging.handlers import RotatingFileHandler
+import psutil  # Optional, for memory usage logging
+import traceback
+import subprocess
+import sys
 
 # Common stop words to skip for AI categorization
 STOP_WORDS = {
@@ -47,15 +51,15 @@ class FlaggedItem(BaseModel):
 class APIResponse(BaseModel):
     choices: List[dict] = Field(default_factory=list)
 
-# Configure logging with rotation
+# Configure logging with a 50MB limit and one backup
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 
 # Create a RotatingFileHandler
 rotating_handler = RotatingFileHandler(
     filename='pdfscan.log',  # Updated log file name
-    maxBytes=1_000_000,      # Rotate when file reaches 1 MB (1,000,000 bytes)
-    backupCount=5            # Keep up to 5 backup files (pdascan.log.1, pdascan.log.2, ..., pdascan.log.5)
+    maxBytes=50 * 1024 * 1024,  # 50MB
+    backupCount=1            # Keep up to 5 backup files (pdascan.log.1, pdascan.log.2, ..., pdascan.log.5)
 )
 
 # Define the log format
@@ -68,7 +72,6 @@ logger.addHandler(rotating_handler)  # Add the rotating file handler
 logger.addHandler(logging.StreamHandler())  # Also output to console
 
 BASE_URL = "https://api.x.ai/v1"
-XAI_API_KEY = "xai-wXiK6UcD68YZWcayjPdGjhkZtrjR6YZUrna53SkdbaOWvQymKTjnt8H2y8xSOa2d4tBpsNDTGsnfUYfY"
 output_dir = os.getcwd()
 
 stop_scanning = False
@@ -77,6 +80,7 @@ CHUNK_SIZE = 10
 api_cache = {}
 
 def grok_scan_content(content, is_image=False, retries=3, base_delay=5, challenge_report=False):
+    global stop_scanning
     if isinstance(content, io.BytesIO):
         content.seek(0)
         cache_key = hashlib.md5(content.read()).hexdigest()
@@ -209,7 +213,7 @@ def grok_scan_content(content, is_image=False, retries=3, base_delay=5, challeng
             )
 
         payload = {
-            "model": "grok-2-latest",
+            "model": "grok-3-fast-beta",
             "messages": [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": content}
@@ -219,6 +223,10 @@ def grok_scan_content(content, is_image=False, retries=3, base_delay=5, challeng
         }
     
     for attempt in range(retries):
+        if stop_scanning:
+            print("Scanning stopped by user.")
+            logging.info("Scanning stopped by user.")
+            return [], False
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
             if response.status_code == 429:  # Rate limit exceeded
@@ -264,6 +272,9 @@ def grok_scan_content(content, is_image=False, retries=3, base_delay=5, challeng
 
             try:
                 parsed = json.loads(flagged_content)
+				 # Handle dictionary response with 'analysis' key
+                if isinstance(parsed, dict) and 'analysis' in parsed:
+                    parsed = parsed['analysis']
                 if not isinstance(parsed, list):
                     print(f"Warning: API returned non-list response: {parsed}")
                     logging.warning(f"API returned non-list response: {parsed}")
@@ -296,6 +307,10 @@ def grok_scan_content(content, is_image=False, retries=3, base_delay=5, challeng
             print(f"API request failed (attempt {attempt + 1}/{retries}): {e}")
             logging.error(f"API request failed (attempt {attempt + 1}/{retries}): {e}")
             if attempt < retries - 1:
+                if stop_scanning:
+                    print("Scanning stopped by user during retry wait.")
+                    logging.info("Scanning stopped by user during retry wait.")
+                    return [], False
                 time.sleep(base_delay)
                 if isinstance(content, io.BytesIO):
                     content.seek(0)
@@ -325,9 +340,9 @@ def generate_grok_report(flagged_content, title, author, flagged_page_width, fla
     prompt = (
         "You are an educational content analyst. Based on the following flagged content from a book, "
         "generate a brief report (150-200 words) including: "
-        "1. A summary of the flagged content found in the book (e.g., types of terms or imagery). "
+        "1. A detailed and specific summary of the flagged content found in the book, including examples of terms or imagery (e.g., 'abortion, STDs, HIV, LGBTQ+ references') and their contexts where possible. "
         "2. Potential harm this content could have on young, impressionable students (e.g., emotional distress, inappropriate exposure). "
-        "3. A recommended minimum age requirement for exposure to this content, with a brief justification. Take into consideration that the age of sexual consent in most US states is 18 years old. A child should NEVER keep secrets from their parents - especially if an adult asks you to. No use of the internet to meet strangers is ever permitted for someone under the age of 18."
+        "3. A recommendation on the minimum age requirement for exposure to this content, phrased negatively (e.g., 'this book is not appropriate for readers under the age of X') with a brief justification. Take into consideration that the age of sexual consent in most US states is 18 years old. A child should NEVER keep secrets from their parents - especially if an adult asks them to. No use of the internet to meet strangers is ever permitted for someone under the age of 18. For content with terms in categories like 'Nudity,' 'Violence,' 'Sexual Content,' or 'Abhorrent Words' with severity 4 or 5, recommend 18+ due to the explicit or egregious nature of the material."
         "Format the response as plain text, suitable for inclusion in a PDF report page. "
         "Use ** to denote section headers (e.g., **Summary of Flagged Content**). "
         f"Book Title: {title or 'Unknown'}\n"
@@ -338,7 +353,7 @@ def generate_grok_report(flagged_content, title, author, flagged_page_width, fla
     url = f"{BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": "grok-2-latest",
+        "model": "grok-3-fast-beta",
         "messages": [{"role": "system", "content": prompt}],
         "max_tokens": 500,
         "temperature": 0.7
@@ -359,6 +374,18 @@ def generate_grok_report(flagged_content, title, author, flagged_page_width, fla
             result = response.json()
             report_text = result.get("choices", [{}])[0].get("message", {}).get("content", report_text)
             print(f"Retried with higher tokens, new text: {report_text}")
+
+        # Extract the minimum age from the report text
+        age_match = re.search(r'readers under the age of (\d+)', report_text)
+        if age_match:
+            min_age = int(age_match.group(1))
+            logging.debug(f"Extracted minimum age: {min_age}")
+            # Add supplemental note if the minimum age is 16
+            if min_age == 16:
+                report_text += "\n\n**Note:** Not recommended for high school as content may be too mature for some students"
+        else:
+            logging.error("Failed to extract minimum age from report text. The API response may not contain the expected recommendation format.")
+            raise ValueError("Could not extract minimum age from report text. Ensure the API response includes a recommendation in the format 'readers under the age of X'.")
 
         report_img = Image.new("RGB", (flagged_page_width, flagged_page_height), "white")
         draw = ImageDraw.Draw(report_img)
@@ -432,8 +459,13 @@ def generate_grok_report(flagged_content, title, author, flagged_page_width, fla
         print(f"Failed to generate report: {e}")
         logging.error(f"Failed to generate report: {e}")
         return None
-
+		
 def generate_index_page(title, author, cover_image, category_tally, flagged_page_width, flagged_page_height, output_dir, sanitized_title, temp_image_paths, challenge_report=False):
+    from threading import Thread
+    import time
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+    
     # List to store paths of all generated index pages
     index_paths = []
 
@@ -453,53 +485,49 @@ def generate_index_page(title, author, cover_image, category_tally, flagged_page
         tally_font = ImageFont.truetype("arial.ttf", int(12 * min(scale_width, scale_height)))
     except Exception:
         tally_font = ImageFont.load_default().font_variant(size=int(12 * min(scale_width, scale_height)))
+    try:
+        page_number_font = ImageFont.truetype("arial.ttf", int(14 * min(scale_width, scale_height)))  # Increased size for page numbers
+    except Exception:
+        page_number_font = ImageFont.load_default().font_variant(size=int(14 * min(scale_width, scale_height)))
 
     # Create a temporary image for text length calculations
     temp_img = Image.new("RGB", (flagged_page_width, flagged_page_height), "white")
     draw = ImageDraw.Draw(temp_img)
 
-    # Prepare items for display
-    all_items = []
+    # Prepare items for display, grouped by category
+    category_groups = []
     for category in sorted(category_tally.keys()):
-        category_with_colon = f"{category}:"
-        wrapped_category = [category_with_colon]
-        col_width = int(flagged_page_width / 4 - 20 * scale_width)
-        if draw.textlength(category_with_colon, font=category_font) > col_width:
-            words = category.split()
-            current_line = ""
-            for word in words:
-                test_line = f"{current_line} {word}" if current_line else word
-                if draw.textlength(test_line + ":", font=category_font) <= col_width:
-                    current_line = test_line
-                else:
-                    if current_line:
-                        wrapped_category.append(current_line + ":")
-                    current_line = word
-            if current_line:
-                wrapped_category.append(current_line + ":")
-        for line in wrapped_category:
-            all_items.append(("category", line))
+        group_items = [("category", f"{category}:")]
         terms = category_tally[category]
         sorted_terms = sorted(terms.items(), key=lambda x: x[0].lower())
-        for i, (term, count) in enumerate(sorted_terms, 1):
+        for term, count in sorted_terms:
             if count > 0:
-                all_items.append(("term", f"{i}. {term}: {count}"))
+                group_items.append(("term", f"{term}: x{count}"))
+        category_groups.append(group_items)
 
     # If no tally, add a placeholder
-    if not all_items:
-        all_items.append(("category", "Offensive Content Tally:"))
-        all_items.append(("term", "No Matches Found in Predefined Egregious Words Dictionary"))
+    if not category_groups:
+        category_groups.append([("category", "Offensive Content Tally:"), ("term", "No Matches Found in Predefined Egregious Words Dictionary")])
 
     # Split items across multiple pages
-    item_height = int(14 * scale_height)
+    base_item_height = int(14 * scale_height)
     col_width = int(flagged_page_width / 4 - 20 * scale_width)
-    margin_bottom = int(50 * scale_height)
+    margin_bottom = int(30 * scale_height)
     num_columns = 4
     page_height_limit = flagged_page_height - margin_bottom
     page_number = 1
+    group_idx = 0
     item_idx = 0
+	
+    def save_image(img, path):
+        try:
+            img.save(path, optimize=True, quality=85)
+            logging.debug(f"Index page saved successfully at: {path}")
+        except Exception as e:
+            logging.error(f"Error saving index page at {path}: {e}")
+            raise
 
-    while True:
+    while group_idx < len(category_groups):
         # Create a new index page
         index_img = Image.new("RGB", (flagged_page_width, flagged_page_height), "white")
         draw = ImageDraw.Draw(index_img)
@@ -561,40 +589,109 @@ def generate_index_page(title, author, cover_image, category_tally, flagged_page
         draw.text((int(10 * scale_width), y_offset), header_text, font=category_font, fill="black")
         y_offset += int(14 * scale_height)
 
-        # Display items on the current page
+        # Calculate available height for items
+        available_height = page_height_limit - y_offset
+        total_items = sum(len(group) for group in category_groups[group_idx:])
+        if total_items > 0:
+            # Calculate the maximum number of items that can fit across all columns
+            max_items_per_column = available_height // base_item_height
+            # Distribute items across columns to maximize space usage
+            items_per_column = max(1, (total_items + num_columns - 1) // num_columns)  # Ceiling division
+            item_height = min(base_item_height, available_height // items_per_column)
+        else:
+            item_height = base_item_height
+
+        # Distribute category groups across columns
         column_y_positions = [y_offset for _ in range(num_columns)]
-        start_idx = item_idx
-        while item_idx < len(all_items):
-            min_y_idx = column_y_positions.index(min(column_y_positions))
-            x_offset = int(10 * scale_width + min_y_idx * (col_width + 10 * scale_width))
-            y = column_y_positions[min_y_idx]
+        col_idx = 0
+        current_group_idx = group_idx
+        current_item_idx = item_idx
 
-            if y + item_height > page_height_limit:
-                break  # Move to next page
+        # Keep track of the tallest column to determine if we need a new page
+        tallest_column_height = y_offset
 
-            item_type, item = all_items[item_idx]
-            if item_type == "category":
-                draw.text((x_offset, y), item, font=category_font, fill="black")
-            else:
-                draw.text((x_offset, y), item, font=tally_font, fill="black")
-            column_y_positions[min_y_idx] += item_height
-            item_idx += 1
+        while current_group_idx < len(category_groups):
+            current_group = category_groups[current_group_idx]
+            x_offset = int(10 * scale_width + col_idx * (col_width + 10 * scale_width))
+            y = column_y_positions[col_idx]
 
-        # Save the current index page
+            # Render items from the current group
+            while current_item_idx < len(current_group):
+                item_type, item = current_group[current_item_idx]
+                if y + item_height > page_height_limit:
+                    # If this item doesn't fit in the current column, try the next column
+                    if col_idx + 1 < num_columns:
+                        col_idx += 1
+                        y = column_y_positions[col_idx]
+                        x_offset = int(10 * scale_width + col_idx * (col_width + 10 * scale_width))
+                        continue
+                    else:
+                        # No more columns available, move to next page
+                        break
+
+                if item_type == "category":
+                    draw.text((x_offset, y), item, font=category_font, fill="black")
+                else:
+                    draw.text((x_offset, y), item, font=tally_font, fill="black")
+                y += item_height
+                column_y_positions[col_idx] = y
+                current_item_idx += 1
+
+            # Update the tallest column height
+            tallest_column_height = max(tallest_column_height, y)
+
+            # If we've rendered all items in the current group, move to the next group
+            if current_item_idx >= len(current_group):
+                current_group_idx += 1
+                current_item_idx = 0
+                col_idx += 1
+
+            # If we've used all columns, check if we need a new page
+            if col_idx >= num_columns:
+                # Check if there are more groups to render and if we've exceeded the page height
+                if current_group_idx < len(category_groups) and tallest_column_height + item_height > page_height_limit:
+                    break  # Move to next page
+                else:
+                    # Reset to the first column and continue filling
+                    col_idx = 0
+                    # Adjust y_offset to the tallest column to start new groups at the same level
+                    y_offset = tallest_column_height
+                    column_y_positions = [y_offset for _ in range(num_columns)]
+
+        # Update group_idx and item_idx for the next page (if needed)
+        group_idx = current_group_idx
+        item_idx = current_item_idx
+
+        # Draw page number
+        page_number_text = f"Page {page_number}"
+        page_number_width = draw.textlength(page_number_text, font=page_number_font)
+        draw.text((flagged_page_width - page_number_width - int(10 * scale_width), flagged_page_height - int(20 * scale_height)), page_number_text, font=page_number_font, fill="black")
+
+        # Save the current index page in a separate thread
         index_path = os.path.join(output_dir, f"{sanitized_title}_index_page_{page_number}.png")
+        logging.debug(f"Starting threaded save for index page {page_number} at: {index_path}")
+        save_thread = Thread(target=save_image, args=(index_img, index_path))
+        save_thread.start()
+        while save_thread.is_alive():
+            if stop_scanning:
+                logging.info(f"Stop requested, abandoning index page {page_number} save")
+                return index_paths  # Exit early, leaving partial results
+            time.sleep(0.1)  # Brief pause to check stop flag
+        save_thread.join()
+
         index_img.save(index_path)
         temp_image_paths.add(index_path)
         index_paths.append(index_path)
         logging.debug(f"Index page {page_number} saved at: {index_path}")
 
-        # If all items are displayed, break
-        if item_idx >= len(all_items):
+        # If all groups are displayed, break
+        if group_idx >= len(category_groups):
             break
 
         page_number += 1
 
     return index_paths
-
+	
 def process_pdf(pdf_path, title, author, cover_image_path, output_dir, app):
     global stop_scanning
     try:
@@ -618,10 +715,14 @@ def process_pdf(pdf_path, title, author, cover_image_path, output_dir, app):
         text_pages = {}
         image_tasks = []
 
-        # Use Turbo Mode if enabled (8 threads), else default to 4
         max_workers = 8 if app.turbo_mode_var.get() else 4
         logging.debug(f"Using {max_workers} threads for processing (Turbo Mode: {app.turbo_mode_var.get()})")
         app.status_label.config(text=f"Loading document with {max_workers} threads...")
+
+        # Check for non-selectable text
+        sample_pages = min(10, total_pages)  # Check up to 10 pages or total pages
+        total_text_length = 0
+        pages_checked = 0
 
         def extract_page_data(page_num):
             if stop_scanning:
@@ -639,9 +740,9 @@ def process_pdf(pdf_path, title, author, cover_image_path, output_dir, app):
                     image = image.resize((int(image.width * 0.9), int(image.height * 0.9)), Image.Resampling.LANCZOS)
                     image.save(temp_img, format="PNG", optimize=True, quality=95)
                     temp_img.seek(0)
+                    logging.debug(f"Image size for page {page_num + 1}, img {img_index + 1}: {image.size}, bytes: {temp_img.getbuffer().nbytes}")
                     page_images.append((temp_img, page_num + 1))
                     print(f"Extracted image {img_index + 1} for page {page_num + 1}")
-                    logging.debug(f"Extracted image {img_index + 1} for page {page_num + 1}")
                 except Exception as e:
                     print(f"Failed to extract image {img_index + 1} for page {page_num + 1}: {e}")
                     logging.error(f"Image extraction failed for page {page_num + 1}: {e}")
@@ -661,10 +762,51 @@ def process_pdf(pdf_path, title, author, cover_image_path, output_dir, app):
                     app.update_progress(page_num - 1, total_pages, f"Extracting text and images for page {page_num} of {total_pages}...", None, None)
                     text_pages[page_num] = text
                     image_tasks.extend(page_images)
+                    # Accumulate text length for non-selectable text check
+                    if page_num <= sample_pages:
+                        total_text_length += len(text.strip())
+                        pages_checked += 1
                 else:
                     logging.warning(f"Page {page_num} extraction returned None")
             logging.debug(f"Active threads after page extraction: {threading.active_count()}")
         logging.debug(f"Page extraction took {time.time() - start_time:.2f} seconds with {max_workers} threads")
+
+        # Check if text is minimal (likely non-selectable)
+        if pages_checked > 0:
+            avg_text_length = total_text_length / pages_checked
+            if avg_text_length < 50:  # Threshold for minimal text
+                # Use threading.Event to wait for user response
+                response_event = threading.Event()
+                response_holder = [None]  # List to store response (mutable for closure)
+
+                def show_ocr_prompt():
+                    response = messagebox.askyesnocancel(
+                        "Non-Selectable Text Detected",
+                        "The selected PDF appears to contain non-selectable text (e.g., scanned images). "
+                        "Would you like to stop the scan and convert it to selectable text using the OCR converter?\n\n"
+                        "Yes: Stop scan and convert now\n"
+                        "No: Continue scanning without conversion\n"
+                        "Cancel: Stop scan entirely"
+                    )
+                    response_holder[0] = response
+                    response_event.set()
+
+                # Schedule prompt in main thread
+                app.root.after(0, show_ocr_prompt)
+                
+                # Wait for user response in scanning thread
+                response_event.wait()
+                response = response_holder[0]
+
+                if response is True:  # User chose "Yes"
+                    app.stop_scan()
+                    app.root.after(0, app.run_ocr_converter)
+                    return None, None, 0, None, None, None, None, None, None, None, "Scan stopped for OCR conversion", {}, {}, set()
+                elif response is False:  # User chose "No"
+                    pass  # Continue scanning
+                else:  # User chose "Cancel" or closed dialog
+                    app.stop_scan()
+                    return None, None, 0, None, None, None, None, None, None, None, "Scan cancelled by user", {}, {}, set()
 
         saved_pages = set()
         for chunk_start in range(0, total_pages, CHUNK_SIZE):
@@ -747,7 +889,6 @@ def process_pdf(pdf_path, title, author, cover_image_path, output_dir, app):
                         print(f"Error saving page {page_key}: {str(e)}")
                         logging.error(f"Error saving page {page_key}: {e}")
 
-        # ... (Rest of the function unchanged: sorting, dimensions, return statement) ...
         if app.challenge_report_var.get():
             output_images_with_pages = []
             for img_path in output_images:
@@ -1005,80 +1146,209 @@ def process_epub(epub_path, title, author, cover_image_path, output_dir, app):
         return None, None, 0, None, None, None, None, None, None, None, f"Error processing EPUB: {str(e)}", {}, {}, set()
 		
 def pack_images_to_pdf(image_paths, output_dir, base_name, app=None, include_report=False, report_img=None, temp_image_paths=None):
+    import psutil
+    import time
+    import errno
+    
     if not image_paths:
         print("No images to pack into PDF.")
+        logging.info("No images provided for PDF packing.")
         return None, 0
+    
     try:
         pdf_path = os.path.join(output_dir, f"{base_name}_flagged_content.pdf")
+        logging.info(f"Starting PDF packing to {pdf_path} with {len(image_paths)} images")
         pdf_doc = fitz.open()
+        logging.debug(f"Initialized empty PDF document: {pdf_doc}")
 
-        # Add all images in image_paths (including index pages, report, and flagged pages)
+        # Log initial memory usage
+        process = psutil.Process()
+        mem_before = process.memory_info().rss / (1024 * 1024)  # MB
+        logging.debug(f"Memory usage before processing: {mem_before:.2f} MB")
+
+        # Process each image
         for i, img_path in enumerate(image_paths):
-            # Skip if this is the report path (already included in image_paths)
-            if "_report.png" in img_path:
+            start_time = time.time()
+            logging.debug(f"Processing image {i + 1}/{len(image_paths)}: {img_path}")
+
+            # Check if file exists and is accessible
+            if not os.path.exists(img_path):
+                logging.error(f"Image file does not exist: {img_path}")
+                continue
+
+            try:
+                # Open and verify image for corruption
+                logging.debug(f"Verifying image for corruption: {img_path}")
                 img = Image.open(img_path)
-                if img.mode != "RGB":
-                    img = img.convert("RGB")
-                temp_img = io.BytesIO()
-                img.save(temp_img, format="PNG", optimize=True, quality=95)
-                temp_img.seek(0)
-                pdf_page = pdf_doc.new_page(width=img.width, height=img.height)
-                pdf_page.insert_image(pdf_page.rect, stream=temp_img.read(), keep_proportion=True)
-                temp_img.close()
-            else:
+                img.verify()  # Check for corruption
+                img.close()  # Close immediately after verification
+                logging.debug(f"Image verified successfully: {img_path}")
+
+                # Reopen image for processing
+                logging.debug(f"Opening image for processing: {img_path}")
                 img = Image.open(img_path)
+                logging.debug(f"Opened image: {img_path}, format={img.format}, mode={img.mode}, size={img.size}")
+
+                # Check for valid image dimensions
+                if img.size[0] <= 0 or img.size[1] <= 0:
+                    logging.error(f"Invalid image dimensions for {img_path}: {img.size}")
+                    img.close()
+                    continue
+
+                # Convert to RGB if necessary
                 if img.mode != "RGB":
+                    logging.debug(f"Converting image {img_path} to RGB mode")
                     img = img.convert("RGB")
-                resized_img = img.resize((int(img.width * 0.9), int(img.height * 0.9)), Image.Resampling.LANCZOS)
 
-                draw = ImageDraw.Draw(resized_img)
-                try:
-                    font = ImageFont.truetype("arial.ttf", 20)
-                except Exception:
-                    font = ImageFont.load_default().font_variant(size=20)
-                page_num = int(os.path.basename(img_path).split("_page_")[1].split(".")[0])
-                text = f"Page {page_num}"
-                text_bbox = draw.textbbox((0, 0), text, font=font)
-                text_width, text_height = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
-                draw.text((resized_img.width - text_width - 10, resized_img.height - text_height - 10), text, font=font, fill="black")
+                # Handle report image separately (no resizing for index page)
+                if "_report.png" in img_path:
+                    logging.info(f"Processing report image: {img_path}")
+                    temp_img = io.BytesIO()
+                    logging.debug(f"Saving report image to buffer: {img_path}")
+                    img.save(temp_img, format="PNG", optimize=True, quality=95)
+                    temp_img.seek(0)
+                    img_data_size = temp_img.getbuffer().nbytes / (1024 * 1024)  # MB
+                    logging.debug(f"Report image buffer size: {img_data_size:.2f} MB")
 
-                temp_img = io.BytesIO()
-                resized_img.save(temp_img, format="PNG", optimize=True, quality=95)
-                temp_img.seek(0)
+                    # Create new PDF page
+                    pdf_page = pdf_doc.new_page(width=img.width, height=img.height)
+                    logging.debug(f"Created PDF page {i + 1} with dimensions {img.width}x{img.height}")
 
-                pdf_page = pdf_doc.new_page(width=resized_img.width, height=resized_img.height)
-                pdf_page.insert_image(pdf_page.rect, stream=temp_img.read(), keep_proportion=True)
-                temp_img.close()
+                    # Insert image into PDF
+                    logging.debug(f"Inserting report image into PDF page {i + 1}")
+                    pdf_page.insert_image(pdf_page.rect, stream=temp_img.read(), keep_proportion=True)
+                    temp_img.close()
+                    img.close()  # Close image promptly
+                    logging.debug(f"Completed report image insertion")
 
-            if app and app.pack_to_pdf_var.get():
-                app.ticker_label.config(text=f"Packing PDF: Added page {i + 1} of {len(image_paths)}")
-                app.pack_progress_bar["value"] = ((i + 1) / len(image_paths)) * 100  # Adjusted denominator
-                app.root.update_idletasks()
+                else:
+                    # Selective resizing based on dimension threshold
+                    logging.debug(f"Checking image dimensions for resizing: {img_path}, size={img.size}")
+                    max_dimension = 2000  # Resize if width or height exceeds 2000 pixels
+                    resize_factor = 0.7   # Reduce dimensions by 30% for qualifying images
 
+                    if max(img.size[0], img.size[1]) > max_dimension:
+                        logging.debug(f"Image exceeds threshold ({img.size[0]}x{img.size[1]} > {max_dimension}), resizing with factor {resize_factor}")
+                        resize_start = time.time()
+                        new_width = int(img.width * resize_factor)
+                        new_height = int(img.height * resize_factor)
+                        resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                        img.close()  # Close original image promptly
+                        resize_time = time.time() - resize_start
+                        logging.debug(f"Resized image {img_path} to {resized_img.size} in {resize_time:.2f} seconds")
+                    else:
+                        logging.debug(f"Image within threshold ({img.size[0]}x{img.size[1]} <= {max_dimension}), using original size")
+                        resized_img = img  # Keep original image without resizing
+
+                    # Add page number annotation
+                    draw = ImageDraw.Draw(resized_img)
+                    try:
+                        font = ImageFont.truetype("arial.ttf", 20)
+                        logging.debug("Loaded truetype font: arial.ttf")
+                    except Exception as e:
+                        font = ImageFont.load_default().font_variant(size=20)
+                        logging.warning(f"Failed to load truetype font, using default: {e}")
+
+                    page_num = int(os.path.basename(img_path).split("_page_")[1].split(".")[0])
+                    text = f"Page {page_num}"
+                    text_bbox = draw.textbbox((0, 0), text, font=font)
+                    text_width, text_height = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
+                    draw.text((resized_img.width - text_width - 10, resized_img.height - text_height - 10), text, font=font, fill="black")
+                    logging.debug(f"Added page number annotation '{text}' to image {img_path}")
+
+                    # Save to temporary buffer
+                    temp_img = io.BytesIO()
+                    logging.debug(f"Saving image to buffer: {img_path}")
+                    resized_img.save(temp_img, format="PNG", optimize=True, quality=95)
+                    temp_img.seek(0)
+                    img_data_size = temp_img.getbuffer().nbytes / (1024 * 1024)  # MB
+                    logging.debug(f"Image buffer size: {img_data_size:.2f} MB")
+
+                    # Create new PDF page
+                    pdf_page = pdf_doc.new_page(width=resized_img.width, height=resized_img.height)
+                    logging.debug(f"Created PDF page {i + 1} with dimensions {resized_img.width}x{resized_img.height}")
+
+                    # Insert image into PDF
+                    logging.debug(f"Inserting image into PDF page {i + 1}")
+                    insert_start = time.time()
+                    pdf_page.insert_image(pdf_page.rect, stream=temp_img.read(), keep_proportion=True)
+                    insert_time = time.time() - insert_start
+                    logging.debug(f"Inserted image into PDF page {i + 1} in {insert_time:.2f} seconds")
+                    temp_img.close()
+                    if resized_img is not img:  # Only close if resized_img was created
+                        resized_img.close()  # Close resized image promptly
+                    else:
+                        img.close()  # Close original image if not resized
+                    logging.debug(f"Completed image insertion")
+
+                # Update UI progress if app is provided
+                if app and app.pack_to_pdf_var.get():
+                    app.ticker_label.config(text=f"Packing PDF: Added page {i + 1} of {len(image_paths)}")
+                    app.pack_progress_bar["value"] = ((i + 1) / len(image_paths)) * 100
+                    app.root.update_idletasks()
+                    logging.debug(f"Updated UI progress: {i + 1}/{len(image_paths)}")
+
+                # Check and log memory usage after processing each image
+                mem_after = process.memory_info().rss / (1024 * 1024)  # MB
+                logging.debug(f"Memory usage after image {i + 1}: {mem_after:.2f} MB")
+                if mem_after > 2000:  # Warn if memory usage exceeds 2GB
+                    logging.warning(f"High memory usage detected after image {i + 1}: {mem_after:.2f} MB")
+
+                # Log processing time for this image
+                total_time = time.time() - start_time
+                logging.info(f"Completed image {i + 1}/{len(image_paths)} in {total_time:.2f} seconds")
+
+            except Exception as e:
+                logging.error(f"Error processing image {img_path}: {e}", exc_info=True)
+                continue
+
+        # Save the PDF
+        logging.debug(f"Saving PDF to {pdf_path}")
+        save_start = time.time()
         pdf_doc.save(pdf_path, garbage=4, deflate=True, clean=True)
+        save_time = time.time() - save_start
+        logging.debug(f"PDF saved in {save_time:.2f} seconds")
         pdf_doc.close()
         pdf_size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
-        print(f"Saved packed PDF: {pdf_path} (Size: {pdf_size_mb:.2f} MB)")
+        logging.info(f"Saved packed PDF: {pdf_path} (Size: {pdf_size_mb:.2f} MB)")
+
+        # Update UI on completion
         if app and app.pack_to_pdf_var.get():
             app.ticker_label.config(text=f"PDF Packing Complete: {pdf_path}")
             app.pack_progress_bar["value"] = 100
+            logging.debug("Updated UI to indicate PDF packing completion")
 
-        print(f"Directory contents before deletion: {os.listdir(output_dir)}")
+        # Clean up temporary images with retry mechanism
+        logging.debug(f"Directory contents before deletion: {os.listdir(output_dir)}")
         all_paths_to_delete = set(image_paths) | (temp_image_paths if temp_image_paths else set())
         for img_path in all_paths_to_delete:
-            try:
-                os.remove(img_path)
-                print(f"Deleted image file: {img_path}")
-            except Exception as e:
-                print(f"Failed to delete image file {img_path}: {str(e)}")
-        print(f"Directory contents after deletion: {os.listdir(output_dir)}")
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    os.remove(img_path)
+                    logging.debug(f"Deleted image file: {img_path}")
+                    break
+                except OSError as e:
+                    if e.errno == errno.EACCES:  # File in use
+                        logging.warning(f"File in use, retrying deletion of {img_path} (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(0.5)  # Wait briefly before retrying
+                    else:
+                        logging.error(f"Failed to delete image file {img_path}: {e}")
+                        break
+                except Exception as e:
+                    logging.error(f"Failed to delete image file {img_path}: {e}")
+                    break
+            else:
+                logging.error(f"Could not delete {img_path} after {max_retries} attempts, skipping")
+        logging.debug(f"Directory contents after deletion: {os.listdir(output_dir)}")
 
         return pdf_path, pdf_size_mb
-    except Exception as e:
-        print(f"Error packing PDF: {str(e)}")
-        logging.error(f"Error packing PDF: {e}")
-        return None, 0
 
+    except Exception as e:
+        logging.error(f"Error packing PDF: {e}", exc_info=True)
+        print(f"Error packing PDF: {str(e)}")
+        return None, 0
+		
 def process_file(file_path, title, author, cover_image_path, output_dir, app, pack_to_pdf=False, include_report=False, challenge_report=False):
     logging.debug(f"Starting process_file: file_path={file_path}, title={title}, pack_to_pdf={pack_to_pdf}, include_report={include_report}, challenge_report={challenge_report}")
     file_extension = os.path.splitext(file_path)[1].lower()
@@ -1151,6 +1421,7 @@ def process_file(file_path, title, author, cover_image_path, output_dir, app, pa
         "blow job": {"category": "Sexual Content", "severity": 4},
         "blow you off": {"category": "Sexual Content", "severity": 3},
         "blowies": {"category": "Sexual Content", "severity": 4},
+        "blood": {"category": "Violence", "severity": 3},  # Added
         "boobs": {"category": "Sexual Content", "severity": 3},
         "bourgeoisie": {"category": "Political/Ideological", "severity": 3},
         "brothels": {"category": "Sexual Content", "severity": 4},
@@ -1194,13 +1465,16 @@ def process_file(file_path, title, author, cover_image_path, output_dir, app, pa
         "cum": {"category": "Sexual Content", "severity": 3},
         "cunt": {"category": "Vulgar Language", "severity": 3},
         "damn": {"category": "Vulgar Language", "severity": 2},
+        "dead": {"category": "Violence", "severity": 2},  # Added
+        "death": {"category": "Violence", "severity": 2},  # Added
         "defaced flag": {"category": "Political/Ideological", "severity": 3},
         "demerol": {"category": "Drug/Alcohol Use", "severity": 3},
         "dental dams": {"category": "Sexual Content", "severity": 3},
         "dick": {"category": "Vulgar Language", "severity": 2},
         "dick-shaped": {"category": "Sexual Content", "severity": 3},
         "dickhead": {"category": "Vulgar Language", "severity": 2},
-        "die": {"category": "Violence", "severity": 3},
+        "die": {"category": "Violence", "severity": 3},  # Added
+        "died": {"category": "Violence", "severity": 3},  # Added
         "dildos": {"category": "Sexual Content", "severity": 4},
         "douche": {"category": "Vulgar Language", "severity": 2},
         "drag queen": {"category": "Sensitive Social Topics", "severity": 2},
@@ -1209,6 +1483,7 @@ def process_file(file_path, title, author, cover_image_path, output_dir, app, pa
         "drinking alcohol": {"category": "Drug/Alcohol Use", "severity": 2},
         "drinking heavily": {"category": "Drug/Alcohol Use", "severity": 3},
         "drugs": {"category": "Drug/Alcohol Use", "severity": 3},
+        "dying": {"category": "Violence", "severity": 3},  # Added
         "dyke": {"category": "Derogatory/Racial Slang", "severity": 4},
         "ecstasy": {"category": "Drug/Alcohol Use", "severity": 3},
         "ejaculated": {"category": "Sexual Content", "severity": 3},
@@ -1264,7 +1539,7 @@ def process_file(file_path, title, author, cover_image_path, output_dir, app, pa
         "jizz": {"category": "Sexual Content", "severity": 3},
         "kegger party": {"category": "Drug/Alcohol Use", "severity": 3},
         "kike": {"category": "Derogatory/Racial Slang", "severity": 5},
-        "kill": {"category": "Violence", "severity": 3},
+        "kill": {"category": "Violence", "severity": 4},  # Adjusted severity to 4
         "kill him": {"category": "Violence", "severity": 4},
         "kill you": {"category": "Violence", "severity": 4},
         "kissed": {"category": "Sexual Content", "severity": 2},
@@ -1455,36 +1730,101 @@ def process_file(file_path, title, author, cover_image_path, output_dir, app, pa
 
     # Decide pages to save
     pages_to_save = set()
-    TARGET_CHALLENGE_PAGES = 10  # Target ~10 pages
+    TARGET_CHALLENGE_PAGES = 14  # Target 14 pages
     MAX_CHALLENGE_PAGES = 20    # Absolute maximum
     MIN_SCORE_THRESHOLD = 1.0   # Minimum score to include a page
+    EXPANSION_SCORE_THRESHOLD = 100.0  # Score threshold to expand beyond TARGET_CHALLENGE_PAGES
 
     if challenge_report:
         # Scoring system for Challenge mode
         score_dict = {}
         for page_num, flagged_items in original_page_flagged_content.items():
             score_dict[page_num] = 0
+            base_score = 0
+            image_score_boost = 0  # Track image-based flags separately
+            has_significant_image_flags = False  # Track if page has significant image-based flags
+            has_nudity = False  # Track if page has nudity
+            has_high_severity_nudity = False  # Track if page has nudity with severity 3 or higher
+
             for item in flagged_items:
                 severity = item.severity
+                # Base scoring for all items (reduced to limit text-based flag accumulation)
                 if severity == 5:
-                    score_dict[page_num] += 5
+                    base_score += 2
                 elif severity == 4:
-                    score_dict[page_num] += 3
+                    base_score += 1
                 elif severity == 3:
-                    score_dict[page_num] += 1
+                    base_score += 0.5
                 elif severity == 2:
-                    score_dict[page_num] += 0.5
+                    base_score += 0.2
                 else:
-                    score_dict[page_num] += 0.1
+                    base_score += 0.05
                 if item.category == "Egregious Content" or item.category == "Abhorrent Words":
-                    score_dict[page_num] += 2
+                    base_score += 1
+
+                # Additional boost for image-based flags
+                if item.context.lower().find("image") != -1 or item.category in ["Nudity", "Violence", "Egregious or Abhorrent Content"]:
+                    if item.category in ["Nudity", "Violence", "Egregious or Abhorrent Content"]:
+                        # Boost all nudity, violence, and egregious content
+                        if item.category == "Nudity":
+                            has_nudity = True
+                            if severity >= 4:
+                                image_score_boost += 70  # High boost for severe nudity
+                            elif severity == 3:
+                                image_score_boost += 60  # Moderate boost for concerning nudity
+                                has_high_severity_nudity = True
+                            else:
+                                image_score_boost += 30  # Base boost for low-severity nudity
+                            if severity >= 3:
+                                has_high_severity_nudity = True
+                        else:
+                            if severity >= 4:
+                                image_score_boost += 30  # High boost for severe violence/egregious
+                            elif severity == 3:
+                                image_score_boost += 20  # Moderate boost for concerning violence/egregious
+                            else:
+                                image_score_boost += 10  # Base boost for any violence/egregious
+                        has_significant_image_flags = True  # Mark page as having significant image flags
+                    logging.debug(f"Page {page_num} has image-based flag: {item.term} (category: {item.category}, severity: {severity}), adding boost: {image_score_boost}")
+
+            # Apply a minimum score for pages with nudity
+            if has_nudity:
+                if has_high_severity_nudity:
+                    base_score = max(base_score + image_score_boost, 200)  # Higher minimum for high-severity nudity
+                    logging.debug(f"Page {page_num} has high-severity nudity (severity 3+), ensuring minimum score: {base_score}")
+                else:
+                    base_score = max(base_score + image_score_boost, 100)  # Standard minimum for low-severity nudity
+                    logging.debug(f"Page {page_num} has nudity, ensuring minimum score: {base_score}")
+            else:
+                base_score += image_score_boost
+
+            # Detect glossary/index pages, but exclude pages with significant image flags
+            text = text_pages.get(page_num, "")
+            lines = text.split('\n')
+            avg_line_length = sum(len(line) for line in lines) / (len(lines) or 1)
+            num_flags = len(flagged_items)
+            has_page_references = any(re.search(r'\d+–\d+|,\s*\d+', line) for line in lines)
+            is_glossary = (num_flags > 15 and avg_line_length < 30) or (num_flags > 10 and has_page_references)
+
+            # Avoid down-weighting pages with significant image flags
+            if is_glossary and not has_significant_image_flags:
+                score_dict[page_num] = base_score * 0.01  # Reduce score by 99%
+                logging.debug(f"Page {page_num} detected as glossary/index; score reduced from {base_score} to {score_dict[page_num]}")
+            else:
+                score_dict[page_num] = base_score
+                if is_glossary:
+                    logging.debug(f"Page {page_num} has significant image flags, skipping glossary down-weighting; final score: {score_dict[page_num]}")
 
         # Sort and limit pages
         sorted_pages = sorted(score_dict.items(), key=lambda x: x[1], reverse=True)
         eligible_pages = [(page_num, score) for page_num, score in sorted_pages if score >= MIN_SCORE_THRESHOLD]
+        
+        # Select at least TARGET_CHALLENGE_PAGES, and expand up to MAX_CHALLENGE_PAGES if there are more pages with high scores
         top_pages = eligible_pages[:TARGET_CHALLENGE_PAGES]
-        if len(top_pages) < TARGET_CHALLENGE_PAGES and len(eligible_pages) > TARGET_CHALLENGE_PAGES:
-            top_pages = eligible_pages[:min(MAX_CHALLENGE_PAGES, len(eligible_pages))]
+        # Expand to include more pages if they have scores above EXPANSION_SCORE_THRESHOLD
+        additional_pages = [(page_num, score) for page_num, score in eligible_pages[TARGET_CHALLENGE_PAGES:] if score >= EXPANSION_SCORE_THRESHOLD]
+        top_pages.extend(additional_pages[:MAX_CHALLENGE_PAGES - TARGET_CHALLENGE_PAGES])
+        
         pages_to_save.update(page_num for page_num, _ in top_pages)
         logging.debug(f"Challenge mode: Selected {len(pages_to_save)} pages with scores: {dict(top_pages)}")
     else:
@@ -1502,8 +1842,8 @@ def process_file(file_path, title, author, cover_image_path, output_dir, app, pa
     for page_num, text in text_pages.items():
         text_lower = text.lower()
         for word, info in OFFENSIVE_WORDS.items():
-            # Count occurrences of the word, even within phrases
-            count = sum(1 for _ in re.finditer(r'\b' + re.escape(word) + r'\b|\S*' + re.escape(word) + r'\S*', text_lower))
+            # Count only exact word matches with word boundaries
+            count = sum(1 for _ in re.finditer(r'\b' + re.escape(word) + r'\b', text_lower))
             if count > 0:
                 category_tally[info["category"]][word] += count
 
@@ -1552,6 +1892,9 @@ def process_file(file_path, title, author, cover_image_path, output_dir, app, pa
 class PDFScannerApp:
     def __init__(self, root):
         self.root = root
+		# Set config file path
+        self.config_path = "config.json"
+        self.load_config()
         self.root.title("BLOCKADE PDF/EPUB Content Scanner")
         self.root.geometry("800x850")
 
@@ -1608,6 +1951,10 @@ class PDFScannerApp:
         self.cover_btn = tk.Button(left_frame, text="Select Cover Image", command=self.select_cover_image)
         self.cover_btn.pack(pady=5)
         self.create_tooltip(self.cover_btn, "Select an optional cover image for the book.")
+		
+        self.ocr_btn = tk.Button(left_frame, text="Convert to Selectable Text", command=self.run_ocr_converter, state="disabled")
+        self.ocr_btn.pack(pady=5)
+        self.create_tooltip(self.ocr_btn, "Convert a PDF with non-selectable text (e.g., graphic novel) to selectable scannable text using OCR.")
 
         right_frame = tk.Frame(main_frame, bg="#f0f0f0")
         right_frame.pack(side=tk.RIGHT, padx=10)
@@ -1697,22 +2044,119 @@ class PDFScannerApp:
         self.result_label.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5)
         self.create_tooltip(self.result_label, "Shows detailed results of the scan.")
 
+    def load_config(self):
+        # Define the config file path
+        if not os.path.exists(self.config_path):
+            self.create_default_config()
+        
+        # Load the config file
+        try:
+            with open(self.config_path, 'r') as f:
+                config = json.load(f)
+                global XAI_API_KEY
+                XAI_API_KEY = config.get("api_key", "")
+                # If API key is missing or empty, prompt the user
+                if not XAI_API_KEY:
+                    XAI_API_KEY = self.prompt_for_api_key()
+                    if XAI_API_KEY:
+                        config["api_key"] = XAI_API_KEY
+                        try:
+                            with open(self.config_path, 'w') as f:
+                                json.dump(config, f, indent=4)
+                        except Exception as e:
+                            messagebox.showerror("Config Error", f"Failed to save config: {e}")
+        except json.JSONDecodeError:
+            messagebox.showerror("Config Error", "Config file is corrupted. Please delete config.json and restart the application.")
+            XAI_API_KEY = None
+        except Exception as e:
+            messagebox.showerror("Config Error", f"Failed to load config: {e}")
+            XAI_API_KEY = None
+
+    def create_default_config(self):
+        # Create a default config file with an empty API key
+        default_config = {"api_key": ""}
+        try:
+            with open(self.config_path, 'w') as f:
+                json.dump(default_config, f, indent=4)
+        except Exception as e:
+            messagebox.showerror("Config Error", f"Failed to create config file: {e}")
+
+    def prompt_for_api_key(self):
+        # Prompt the user to enter the API key via a dialog
+        api_key = simpledialog.askstring("API Key", "Please enter your Grok API key:", parent=self.root)
+        if api_key is None:
+            messagebox.showwarning("API Key Required", "API key is required to proceed. Please restart the application and provide the API key.")
+            return None
+        return api_key
+
+    def run_ocr_converter(self):
+        if not self.file_path or not os.path.exists(self.file_path):
+            messagebox.showerror("Error", "No PDF file selected or file does not exist!")
+            return
+        
+        # Determine the path to pdf_ocr_converter.exe
+        if hasattr(sys, 'frozen'):
+            # Running as executable
+            exe_dir = os.path.dirname(sys.executable)
+            ocr_exe = os.path.join(exe_dir, "pdf_ocr_converter.exe")
+        else:
+            # Running as script
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            ocr_exe = os.path.join(script_dir, "pdf_ocr_converter.exe")
+
+        if not os.path.exists(ocr_exe):
+            messagebox.showerror("Error", f"OCR converter not found at: {ocr_exe}")
+            return
+
+        try:
+            # Run the OCR converter with the selected PDF as argument
+            logging.debug(f"Running OCR converter: {ocr_exe} {self.file_path}")
+            result = subprocess.run([ocr_exe, self.file_path], capture_output=True, text=True)
+            logging.debug(f"OCR result: returncode={result.returncode}, stderr={result.stderr}")
+            if result.returncode == 0:
+                # Construct the expected output PDF path
+                base, ext = os.path.splitext(self.file_path)
+                output_pdf = f"{base}_searchable{ext}"
+                if os.path.exists(output_pdf):
+                    # Auto-select the output PDF and continue scanning
+                    self.file_path = output_pdf
+                    self.file_label.config(text=f"Selected: {os.path.basename(output_pdf)}")
+                    self.scan_btn.config(state="normal")
+                    self.ocr_btn.config(state="normal")
+                    messagebox.showinfo("Success", f"PDF converted to selectable text: {output_pdf}\nContinuing scan with the converted file.")
+                    # Automatically start scanning the new PDF
+                    self.start_scan()
+                else:
+                    messagebox.showerror("Error", f"OCR conversion succeeded, but the output file ({output_pdf}) was not found.\nPlease select the converted PDF manually to continue scanning.")
+                    self.file_path = None
+                    self.file_label.config(text="No file selected")
+                    self.scan_btn.config(state="disabled")
+                    self.ocr_btn.config(state="disabled")
+            else:
+                messagebox.showerror("Error", f"OCR conversion failed: {result.stderr}")
+        except Exception as e:
+            logging.error(f"Failed to run OCR converter: {e}")
+            messagebox.showerror("Error", f"Failed to run OCR converter: {e}")
+			
     def create_tooltip(self, widget, text):
         """Create a tooltip for a given widget."""
         def enter(event):
-            x, y, _, _ = widget.bbox("insert")
-            x += widget.winfo_rootx() + 25
-            y += widget.winfo_rooty() + 25
+            # Use winfo_x, winfo_y for position and offset slightly
+            x = widget.winfo_rootx() + 25
+            y = widget.winfo_rooty() + 25
             self.tooltip = tk.Toplevel(widget)
             self.tooltip.wm_overrideredirect(True)
             self.tooltip.wm_geometry(f"+{x}+{y}")
-            label = tk.Label(self.tooltip, text=text, justify="left", background="#ffffe0", relief="solid", borderwidth=1, font=("Arial", "8"))
+            label = tk.Label(self.tooltip, text=text, justify="left", 
+                             background="#ffffe0", relief="solid", 
+                             borderwidth=1, font=("Arial", "8"))
             label.pack()
-
+    
         def leave(event):
             if hasattr(self, 'tooltip'):
                 self.tooltip.destroy()
-
+    
+        # Bind the events to the widget
         widget.bind("<Enter>", enter)
         widget.bind("<Leave>", leave)
 
@@ -1721,10 +2165,15 @@ class PDFScannerApp:
         if self.file_path:
             self.file_label.config(text=f"Selected: {os.path.basename(self.file_path)}")
             self.scan_btn.config(state="normal")
+            if self.file_path.lower().endswith('.pdf'):
+                self.ocr_btn.config(state="normal")
+            else:
+                self.ocr_btn.config(state="disabled")
         else:
             self.file_label.config(text="No file selected")
             self.scan_btn.config(state="disabled")
-
+            self.ocr_btn.config(state="disabled")
+			
     def select_cover_image(self):
         self.cover_image_path = filedialog.askopenfilename(title="Select Book Cover Image", filetypes=[("Image files", "*.png *.jpg *.jpeg")])
         if self.cover_image_path:
@@ -1733,6 +2182,9 @@ class PDFScannerApp:
             messagebox.showwarning("Warning", "No cover image selected. First page/cover will be used.")
 
     def start_scan(self):
+        if not XAI_API_KEY:
+            messagebox.showerror("Error", "API key is not set. Please restart the application and provide the API key.")
+            return
         if not self.file_path:
             messagebox.showerror("Error", "Please select a file first!")
             return
@@ -1849,6 +2301,13 @@ class PDFScannerApp:
                     self.result_label.delete(1.0, tk.END)
                     self.result_label.insert(tk.END, result_text)
                     messagebox.showwarning("Warning", f"PDF packing failed.\n\nYour scan finished in {minutes} minutes, {seconds} seconds.")
+					# Delete temporary images if packing was intended but failed
+                    for img_path in img_paths:
+                        try:
+                            os.remove(img_path)
+                            print(f"Deleted temporary image: {img_path}")
+                        except Exception as e:
+                            print(f"Failed to delete {img_path}: {e}")
             else:
                 try:
                     img = Image.open(img_paths[0])
