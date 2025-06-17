@@ -47,6 +47,23 @@ class FlaggedItem(BaseModel):
     category: str
     severity: int = Field(ge=1, le=5)  # Severity between 1 and 5
     context: str
+	
+class Message(BaseModel):
+    role: str
+    content: str
+
+class Choice(BaseModel):
+    index: int
+    message: Message
+    finish_reason: Optional[str] = None
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str
+    created: int
+    model: str
+    choices: List[Choice]
+    usage: Optional[dict] = None
 
 class APIResponse(BaseModel):
     choices: List[dict] = Field(default_factory=list)
@@ -79,7 +96,7 @@ BATCH_SIZE = 10
 CHUNK_SIZE = 10
 api_cache = {}
 
-def grok_scan_content(content, is_image=False, retries=3, base_delay=5, challenge_report=False):
+def scan_content(content, is_image=False, retries=3, base_delay=5, challenge_report=False, api_provider="grok"):
     global stop_scanning
     if isinstance(content, io.BytesIO):
         content.seek(0)
@@ -89,14 +106,28 @@ def grok_scan_content(content, is_image=False, retries=3, base_delay=5, challeng
         cache_key = hashlib.md5(content.encode('utf-8')).hexdigest()
     cache_key += "_image" if is_image else "_text"
     cache_key += "_challenge" if challenge_report else "_standard"
+    cache_key += f"_{api_provider}"
+
 
     if cache_key in api_cache:
         print(f"Using cached API result for content hash: {cache_key}")
         logging.debug(f"Using cached API result for content hash: {cache_key}")
         return api_cache[cache_key], True
 
-    url = f"{BASE_URL}/chat/completions"
-    headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
+    if api_provider == "grok":
+        url = "https://api.x.ai/v1/chat/completions"
+        api_key = XAI_API_KEY
+        text_model = "grok-3-latest"
+        vision_model = "grok-2-vision-latest"
+    elif api_provider == "openai":
+        url = "https://api.openai.com/v1/chat/completions"
+        api_key = OPENAI_API_KEY
+        text_model = "gpt-4o-mini"
+        vision_model = "gpt-4o"
+    else:
+        raise ValueError(f"Unsupported API provider: {api_provider}")
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     
     if is_image:
         if isinstance(content, io.BytesIO):
@@ -156,7 +187,7 @@ def grok_scan_content(content, is_image=False, retries=3, base_delay=5, challeng
             )
 
         payload = {
-            "model": "grok-2-vision-latest",
+            "model": vision_model,
             "messages": [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}}]}
@@ -213,7 +244,7 @@ def grok_scan_content(content, is_image=False, retries=3, base_delay=5, challeng
             )
 
         payload = {
-            "model": "grok-3-beta",
+            "model": text_model,
             "messages": [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": content}
@@ -237,24 +268,8 @@ def grok_scan_content(content, is_image=False, retries=3, base_delay=5, challeng
                 continue
             response.raise_for_status()
             result = response.json()
-            # Validate API response using Pydantic
-            api_response = APIResponse(**result)
-            flagged_content = api_response.choices[0].get("message", {}).get("content", "[]")
-            flagged_content = flagged_content.strip()
-
-            # Check for incomplete JSON (e.g., missing closing brackets)
-            if flagged_content.count('[') != flagged_content.count(']') or flagged_content.count('{') != flagged_content.count('}'):
-                if attempt < retries - 1:
-                    payload["max_tokens"] += 500  # Increase tokens and retry
-                    print(f"Incomplete JSON detected, increasing max_tokens to {payload['max_tokens']} and retrying (attempt {attempt + 1}/{retries})")
-                    logging.warning(f"Incomplete JSON detected, increasing max_tokens to {payload['max_tokens']} and retrying (attempt {attempt + 1}/{retries})")
-                    if isinstance(content, io.BytesIO):
-                        content.seek(0)
-                    continue
-                else:
-                    print(f"Failed to get complete JSON after {retries} attempts: {flagged_content}")
-                    logging.error(f"Failed to get complete JSON after {retries} attempts: {flagged_content}")
-                    return [], False
+            parsed_response = ChatCompletionResponse.parse_obj(result)
+            flagged_content = parsed_response.choices[0].message.content.strip()
 
             # Extract JSON from potential markdown
             json_start = flagged_content.find("```json")
@@ -299,10 +314,6 @@ def grok_scan_content(content, is_image=False, retries=3, base_delay=5, challeng
                 print(f"JSON decode error: {e} - Raw response: {flagged_content}")
                 logging.error(f"JSON decode error: {e} - Raw response: {flagged_content}")
                 return [], False
-            except Exception as e:
-                print(f"Validation error: {e} - Raw response: {flagged_content}")
-                logging.error(f"Validation error: {e} - Raw response: {flagged_content}")
-                return [], False
         except requests.exceptions.RequestException as e:
             print(f"API request failed (attempt {attempt + 1}/{retries}): {e}")
             logging.error(f"API request failed (attempt {attempt + 1}/{retries}): {e}")
@@ -332,7 +343,7 @@ def flatten_terms(terms):
         flat_list.append(terms)
     return flat_list
 
-def generate_grok_report(flagged_content, title, author, flagged_page_width, flagged_page_height):
+def generate_grok_report(flagged_content, title, author, flagged_page_width, flagged_page_height, api_provider="grok"):
     if not flagged_content:
         return None
     
@@ -350,10 +361,20 @@ def generate_grok_report(flagged_content, title, author, flagged_page_width, fla
         f"Flagged Content: {', '.join(sorted(set(terms_for_report)))}"
     )
     
-    url = f"{BASE_URL}/chat/completions"
-    headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
+    if api_provider == "grok":
+        url = "https://api.x.ai/v1/chat/completions"
+        api_key = XAI_API_KEY
+        model = "grok-3-latest"
+    elif api_provider == "openai":
+        url = "https://api.openai.com/v1/chat/completions"
+        api_key = OPENAI_API_KEY
+        model = "gpt-4o-mini"
+    else:
+        raise ValueError(f"Unsupported API provider: {api_provider}")
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
-        "model": "grok-3-beta",
+        "model": model,
         "messages": [{"role": "system", "content": prompt}],
         "max_tokens": 500,
         "temperature": 0.7
@@ -363,17 +384,17 @@ def generate_grok_report(flagged_content, title, author, flagged_page_width, fla
         response = requests.post(url, headers=headers, data=json.dumps(payload))
         response.raise_for_status()
         result = response.json()
-        report_text = result.get("choices", [{}])[0].get("message", {}).get("content", "Report generation failed.")
-        print(f"Full report text received: {report_text}")
-        
+        parsed_response = ChatCompletionResponse.parse_obj(result)
+        report_text = parsed_response.choices[0].message.content
+
         if report_text.endswith("which could") or report_text.endswith("which could "):
-            print("Warning: Report appears truncated mid-sentence. Retrying with higher max_tokens.")
+            logging.warning("Report appears truncated mid-sentence. Retrying with higher max_tokens.")
             payload["max_tokens"] = 700
             response = requests.post(url, headers=headers, data=json.dumps(payload))
             response.raise_for_status()
             result = response.json()
-            report_text = result.get("choices", [{}])[0].get("message", {}).get("content", report_text)
-            print(f"Retried with higher tokens, new text: {report_text}")
+            parsed_response = ChatCompletionResponse.parse_obj(result)
+            report_text = parsed_response.choices[0].message.content
 
         # Extract the minimum age from the report text
         age_match = re.search(r'readers under the age of (\d+)', report_text)
@@ -417,7 +438,7 @@ def generate_grok_report(flagged_content, title, author, flagged_page_width, fla
 
         sections = re.split(r'\*\*(.*?)\*\*', report_text)
         current_font = body_font
-        extra_spacing = 0
+        section_spacing = 0
 
         for i, section in enumerate(sections):
             section = section.strip()
@@ -445,7 +466,7 @@ def generate_grok_report(flagged_content, title, author, flagged_page_width, fla
 
             for j, line in enumerate(lines):
                 if y_offset > flagged_page_height - int(50 * scale_height):
-                    print(f"Warning: Report truncated at line {j} of section {i} due to page height limit. Remaining text: {lines[j:]}")
+                    logging.warning(f"Report truncated at line {j} of section {i} due to page height limit.")
                     break
                 draw.text((margin_left, y_offset), line, font=current_font, fill="black")
                 y_offset += line_spacing
@@ -696,7 +717,7 @@ def generate_index_page(title, author, cover_image, category_tally, flagged_page
 
     return index_paths
 	
-def process_pdf(pdf_path, title, author, cover_image_path, output_dir, app):
+def process_pdf(pdf_path, title, author, cover_image_path, output_dir, app, api_provider="grok"):
     global stop_scanning
     try:
         pdf_doc = fitz.open(pdf_path)
@@ -823,7 +844,7 @@ def process_pdf(pdf_path, title, author, cover_image_path, output_dir, app):
                     app.update_progress(page_num - 1, total_pages, "Scanning stopped by user.", None, None)
                     break
                 text = text_pages.get(page_num, "")
-                results, used_cache = grok_scan_content(text, is_image=False, challenge_report=app.challenge_report_var.get())
+                results, used_cache = scan_content(text, is_image=False, challenge_report=app.challenge_report_var.get(), api_provider=api_provider)
                 text_results[page_num] = results
                 cache_msg = " (cached)" if used_cache else ""
                 print(f"Page {page_num} text flagged_content: {results}")
@@ -834,7 +855,7 @@ def process_pdf(pdf_path, title, author, cover_image_path, output_dir, app):
             start_time = time.time()
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 logging.debug(f"Active threads before image scanning: {threading.active_count()}")
-                future_to_task = {executor.submit(grok_scan_content, task[0], is_image=True, challenge_report=app.challenge_report_var.get()): task for task in image_tasks if task[1] in range(chunk_start + 1, chunk_end + 1)}
+                future_to_task = {executor.submit(scan_content, task[0], is_image=True, challenge_report=app.challenge_report_var.get(), api_provider=api_provider): task for task in image_tasks if task[1] in range(chunk_start + 1, chunk_end + 1)}
                 for future in concurrent.futures.as_completed(future_to_task):
                     task = future_to_task[future]
                     page_num = task[1]
@@ -924,7 +945,7 @@ def process_pdf(pdf_path, title, author, cover_image_path, output_dir, app):
         logging.error(f"Error in process_pdf: {e}")
         return None, None, 0, None, None, None, None, None, None, None, f"Error processing PDF: {str(e)}", {}, {}, set()
 		
-def process_epub(epub_path, title, author, cover_image_path, output_dir, app):
+def process_epub(epub_path, title, author, cover_image_path, output_dir, app, api_provider="grok"):
     global stop_scanning
     try:
         book = epub.read_epub(epub_path)
@@ -1015,7 +1036,7 @@ def process_epub(epub_path, title, author, cover_image_path, output_dir, app):
                     app.update_progress(page_num - 1, total_pages, "Scanning stopped by user.", None, None)
                     break
                 text = text_pages.get(page_num, "")
-                results, used_cache = grok_scan_content(text, is_image=False, challenge_report=app.challenge_report_var.get())
+                results, used_cache = scan_content(text, is_image=False, challenge_report=app.challenge_report_var.get(), api_provider=api_provider)
                 text_results[page_num] = results
                 cache_msg = " (cached)" if used_cache else ""
                 print(f"Page {page_num} text flagged_content: {results}")
@@ -1024,7 +1045,7 @@ def process_epub(epub_path, title, author, cover_image_path, output_dir, app):
 
             image_results = defaultdict(list)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_task = {executor.submit(grok_scan_content, task[0], is_image=True, challenge_report=app.challenge_report_var.get()): task for task in image_tasks if task[1] in range(chunk_start + 1, chunk_end + 1)}
+                future_to_task = {executor.submit(scan_content, task[0], is_image=True, challenge_report=app.challenge_report_var.get(), api_provider=api_provider): task for task in image_tasks if task[1] in range(chunk_start + 1, chunk_end + 1)}
                 for future in concurrent.futures.as_completed(future_to_task):
                     task = future_to_task[future]
                     page_num = task[1]
@@ -1353,8 +1374,8 @@ def pack_images_to_pdf(image_paths, output_dir, base_name, app=None, include_rep
         print(f"Error packing PDF: {str(e)}")
         return None, 0
 
-def process_file(file_path, title, author, cover_image_path, output_dir, app, pack_to_pdf=False, include_report=False, challenge_report=False):
-    logging.debug(f"Starting process_file: file_path={file_path}, title={title}, pack_to_pdf={pack_to_pdf}, include_report={include_report}, challenge_report={challenge_report}")
+def process_file(file_path, title, author, cover_image_path, output_dir, app, pack_to_pdf=False, include_report=False, challenge_report=False, api_provider="grok"):
+    logging.debug(f"Starting process_file: file_path={file_path}, title={title}, pack_to_pdf={pack_to_pdf}, include_report={include_report}, challenge_report={challenge_report}, api_provider={api_provider}")
     
     # Start timing the scanning process
     start_time = time.time()
@@ -1402,6 +1423,7 @@ def process_file(file_path, title, author, cover_image_path, output_dir, app, pa
         "alcoholism": {"category": "Drug/Alcohol Use", "severity": 3},
         "america is a failed state": {"category": "Political/Ideological", "severity": 3},
         "ammunition": {"category": "Violence", "severity": 2},
+		
         "anal sex": {"category": "Sexual Content", "severity": 4},
         "anger rapists": {"category": "Violence", "severity": 5},
         "anti-american": {"category": "Political/Ideological", "severity": 3},
@@ -1715,7 +1737,7 @@ def process_file(file_path, title, author, cover_image_path, output_dir, app, pa
     if challenge_report:
         for page_num in text_pages:
             text = text_pages.get(page_num, "")
-            text_results, _ = grok_scan_content(text, is_image=False, challenge_report=True)
+            text_results, _ = scan_content(text, is_image=False, challenge_report=True, api_provider=api_provider)
             try:
                 parsed_results = [FlaggedItem(**item) for item in text_results]
                 original_page_flagged_content[page_num] = parsed_results
@@ -1724,7 +1746,7 @@ def process_file(file_path, title, author, cover_image_path, output_dir, app, pa
                 original_page_flagged_content[page_num] = []
         for task in image_tasks:
             page_num = task[1]
-            image_results, _ = grok_scan_content(task[0], is_image=True, challenge_report=True)
+            image_results, _ = scan_content(task[0], is_image=True, challenge_report=True, api_provider=api_provider)
             try:
                 parsed_results = [FlaggedItem(**item) for item in image_results]
                 if page_num in original_page_flagged_content:
@@ -1874,7 +1896,7 @@ def process_file(file_path, title, author, cover_image_path, output_dir, app, pa
     # Generate report if requested
     if include_report and all_flagged_content:
         app.update_progress(total_pages, total_pages, "Generating content analysis report...", None, None)
-        report_img = generate_grok_report(all_flagged_content, title, author, flagged_page_width, flagged_page_height)
+        report_img = generate_grok_report(all_flagged_content, title, author, flagged_page_width, flagged_page_height, api_provider=api_provider)
         if report_img:
             report_path = os.path.join(output_dir, f"{base_name}_report.png")
             report_img.save(report_path)
@@ -1927,6 +1949,7 @@ class PDFScannerApp:
         self.scanning_thread = None
         self.title_var = tk.StringVar()
         self.author_var = tk.StringVar()
+        self.api_var = tk.StringVar(value="Grok")  # Initialize api_var here
         self.cover_image_path = None
         self.pack_to_pdf_var = tk.BooleanVar(value=True)
         self.include_report_var = tk.BooleanVar(value=False)
@@ -1976,6 +1999,18 @@ class PDFScannerApp:
         self.author_entry = tk.Entry(left_frame, textvariable=self.author_var, width=30)
         self.author_entry.pack(pady=5)
         self.create_tooltip(self.author_entry, "Enter the author of the book (optional).")
+        
+        # API provider selection with hyperlink
+        api_frame = tk.Frame(left_frame)
+        api_frame.pack(pady=5)
+        tk.Label(api_frame, text="API Provider:").pack(side=tk.LEFT)
+        api_link = tk.Label(api_frame, text="[enter API key]", fg="blue", cursor="hand2", font=("Arial", 10, "underline"))
+        api_link.pack(side=tk.LEFT, padx=5)
+        api_link.bind("<Button-1>", self.prompt_for_api_keys)
+        self.create_tooltip(api_link, "Click to enter or edit Grok and OpenAI API keys.")
+        api_menu = ttk.OptionMenu(left_frame, self.api_var, "Grok", "Grok", "OpenAI")  # Define api_menu
+        api_menu.pack(pady=5)
+        self.create_tooltip(api_menu, "Select the API to use for content analysis (Grok or OpenAI).")
 
         self.cover_btn = tk.Button(left_frame, text="Select Cover Image", command=self.select_cover_image)
         self.cover_btn.pack(pady=5)
@@ -2091,56 +2126,78 @@ class PDFScannerApp:
         self.create_tooltip(self.link_label, "Click to visit SchoolingDelaware.com for information on school library books.")
 
     def load_config(self):
-        # Define the config file path relative to the executable
         if hasattr(sys, 'frozen'):
             base_dir = os.path.dirname(sys.executable)
         else:
             base_dir = os.path.dirname(os.path.abspath(__file__))
         self.config_path = os.path.join(base_dir, "config.json")
-
+    
         if not os.path.exists(self.config_path):
             self.create_default_config()
         
-        # Load the config file
         try:
             with open(self.config_path, 'r') as f:
                 config = json.load(f)
-                global XAI_API_KEY
-                XAI_API_KEY = config.get("api_key", "")
-                # If API key is missing or empty, prompt the user
-                if not XAI_API_KEY:
-                    XAI_API_KEY = self.prompt_for_api_key()
-                    if XAI_API_KEY:
-                        config["api_key"] = XAI_API_KEY
-                        try:
-                            with open(self.config_path, 'w') as f:
-                                json.dump(config, f, indent=4)
-                        except Exception as e:
-                            messagebox.showerror("Config Error", f"Failed to save config: {e}")
+                global XAI_API_KEY, OPENAI_API_KEY
+                XAI_API_KEY = config.get("xai_api_key", "")
+                OPENAI_API_KEY = config.get("openai_api_key", "")
+                # Warn if both keys are missing, but don't prompt here
+                if not XAI_API_KEY and not OPENAI_API_KEY:
+                    messagebox.showwarning("API Keys Missing", "No API keys found for Grok or OpenAI. Please use the 'Enter API Key' link to provide at least one API key.")
         except json.JSONDecodeError:
             messagebox.showerror("Config Error", "Config file is corrupted. Please delete config.json and restart the application.")
             XAI_API_KEY = None
+            OPENAI_API_KEY = None
         except Exception as e:
             messagebox.showerror("Config Error", f"Failed to load config: {e}")
             XAI_API_KEY = None
-
+            OPENAI_API_KEY = None
+			
     def create_default_config(self):
-        # Create a default config file with an empty API key
-        default_config = {"api_key": ""}
+        default_config = {"xai_api_key": "", "openai_api_key": ""}
         try:
             with open(self.config_path, 'w') as f:
                 json.dump(default_config, f, indent=4)
         except Exception as e:
             messagebox.showerror("Config Error", f"Failed to create config file: {e}")
-
-    def prompt_for_api_key(self):
-        # Prompt the user to enter the API key via a dialog
-        api_key = simpledialog.askstring("API Key", "Please enter your Grok API key:", parent=self.root)
-        if api_key is None:
-            messagebox.showwarning("API Key Required", "API key is required to proceed. Please restart the application and provide the API key.")
-            return None
-        return api_key
-
+    
+    def prompt_for_api_keys(self, event=None):
+        # Create a dialog window
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Enter API Keys")
+        dialog.geometry("400x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+    
+        # Grok API key
+        tk.Label(dialog, text="Grok API Key:").pack(pady=5)
+        grok_entry = tk.Entry(dialog, width=50)
+        grok_entry.pack(pady=5)
+        grok_entry.insert(0, XAI_API_KEY or "")
+    
+        # OpenAI API key
+        tk.Label(dialog, text="OpenAI API Key:").pack(pady=5)
+        openai_entry = tk.Entry(dialog, width=50)
+        openai_entry.pack(pady=5)
+        openai_entry.insert(0, OPENAI_API_KEY or "")
+    
+        def save_keys():
+            global XAI_API_KEY, OPENAI_API_KEY
+            XAI_API_KEY = grok_entry.get().strip()
+            OPENAI_API_KEY = openai_entry.get().strip()
+            config = {"xai_api_key": XAI_API_KEY, "openai_api_key": OPENAI_API_KEY}
+            try:
+                with open(self.config_path, 'w') as f:
+                    json.dump(config, f, indent=4)
+                messagebox.showinfo("Success", "API keys saved successfully.")
+                dialog.destroy()
+            except Exception as e:
+                messagebox.showerror("Config Error", f"Failed to save API keys: {e}")
+    
+        tk.Button(dialog, text="Save", command=save_keys).pack(pady=10)
+        self.create_tooltip(grok_entry, "Enter your Grok API key (provided by xAI).")
+        self.create_tooltip(openai_entry, "Enter your OpenAI API key (provided by OpenAI).")
+    	
     def run_ocr_converter(self):
         if not self.file_path or not os.path.exists(self.file_path):
             messagebox.showerror("Error", "No PDF file selected or file does not exist!")
@@ -2234,8 +2291,11 @@ class PDFScannerApp:
             messagebox.showwarning("Warning", "No cover image selected. First page/cover will be used.")
 
     def start_scan(self):
-        if not XAI_API_KEY:
-            messagebox.showerror("Error", "API key is not set. Please restart the application and provide the API key.")
+        if self.api_var.get().lower() == "grok" and not XAI_API_KEY:
+            messagebox.showerror("Error", "Grok API key is not set. Please use the 'Enter API Key' link to provide the API key.")
+            return
+        if self.api_var.get().lower() == "openai" and not OPENAI_API_KEY:
+            messagebox.showerror("Error", "OpenAI API key is not set. Please use the 'Enter API Key' link to provide the API key.")
             return
         if not self.file_path:
             messagebox.showerror("Error", "Please select a file first!")
@@ -2260,7 +2320,17 @@ class PDFScannerApp:
         self.timer_running = True
         self.update_timer()
 
-        self.scanning_thread = threading.Thread(target=self.run_scan, args=(self.title_var.get(), self.author_var.get(), self.cover_image_path, self.pack_to_pdf_var.get(), self.include_report_var.get()))
+        self.scanning_thread = threading.Thread(
+            target=self.run_scan,
+            args=(
+                self.title_var.get(),
+                self.author_var.get(),
+                self.cover_image_path,
+                self.pack_to_pdf_var.get(),
+                self.include_report_var.get(),
+                self.api_var.get().lower()  # Pass API provider
+            )
+        )
         self.scanning_thread.start()
 
     def stop_scan(self):
@@ -2280,8 +2350,8 @@ class PDFScannerApp:
             self.timer_label.config(text=f"Time Elapsed: {minutes:02d}:{seconds:02d}")
             self.root.after(1000, self.update_timer)
 
-    def run_scan(self, title, author, cover_image_path, pack_to_pdf, include_report):
-        logging.debug(f"Starting run_scan: title={title}, pack_to_pdf={pack_to_pdf}, include_report={include_report}")
+    def run_scan(self, title, author, cover_image_path, pack_to_pdf, include_report, api_provider="grok"):
+        logging.debug(f"Starting run_scan: title={title}, pack_to_pdf={pack_to_pdf}, include_report={include_report}, api_provider={api_provider}")
         if pack_to_pdf:
             self.pack_progress_label.pack(pady=2, before=self.result_frame)
             self.pack_progress_bar.pack(pady=2, before=self.result_frame)
@@ -2289,13 +2359,13 @@ class PDFScannerApp:
         try:
             img_paths, result, pdf_info = process_file(
                 self.file_path, title, author, cover_image_path, self.output_dir, self,
-                pack_to_pdf, include_report, self.challenge_report_var.get()
+                pack_to_pdf, include_report, self.challenge_report_var.get(), api_provider
             )
             self.root.after(0, self.finish_scan, img_paths, result, pdf_info)
         except Exception as e:
             logging.error(f"Error in run_scan: {e}")
             self.root.after(0, self.finish_scan, None, f"Scan failed: {e}", None)
-
+			
     def schedule_preview_update(self, img):
         try:
             img.thumbnail((150, 150))
