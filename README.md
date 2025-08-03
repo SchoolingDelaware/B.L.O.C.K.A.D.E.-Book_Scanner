@@ -1,3 +1,4 @@
+OUTDATED README - ORIGINAL DELETED SO THIS IS A TEMPORARY FILLER UNTILL I CREATE A FULL GUIDE
 # BLOCKADE Ebook Scanner Setup Guide 
 Here's a step-by-step guide to get the “Blocking Lustful Overzealous Content, Keeping Away Depravity and Extremism from children” script running on a Windows PC that does not have Python installed.
 
